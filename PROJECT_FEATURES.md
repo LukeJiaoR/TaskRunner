@@ -1,158 +1,75 @@
-# TaskRunner 项目功能总结
+# TaskRunner Project Features / 项目功能说明
 
-## 项目概述
+> This document summarizes the current public-facing capabilities and architecture of TaskRunner.
+> For installation and quick start, see `README.md`.
+>
+> 本文总结 TaskRunner 当前对外可见的能力与架构。
+> 安装与快速开始请参见 `README.md`。
 
-TaskRunner 是一个基于 Spring Boot 3.0.1 和 Java 17 的最小可用任务运行平台。当前版本提供 REST API，用于创建本地命令任务、启动队列化异步执行、查询运行状态，并读取执行日志。
+## English
 
-当前实现使用 H2/MyBatis 持久化任务定义、运行记录和日志；任务运行通过队列创建 `QUEUED` 记录，再由 worker 消费并执行本地命令。Redis 队列实现已接入，测试环境使用内存队列避免依赖外部 Redis。尚未提供认证授权、GraphQL、SOAP 或生产级沙箱能力。
+### Overview
 
-## 技术架构
+TaskRunner is a lightweight task runner built with Spring Boot 3.0.1 and Java 17. It lets users define local shell-command tasks, queue asynchronous runs, inspect status and logs, and keep execution history in a small relational data model.
 
-### 核心框架
+The public surface of the application is REST-based. The runtime is built around a queue worker and a command runner, with persistence handled through H2 and MyBatis.
 
-- **Spring Boot**: 3.0.1
-- **Java**: 17
-- **构建工具**: Gradle 7.6
-- **包名**: `com.generate.taskrunner`
+### What it does
 
-### 当前实际使用的能力
+- Create task definitions with a name, command, working directory, and timeout.
+- Start asynchronous runs for a task definition.
+- Track run state from `QUEUED` to `RUNNING` and then to `SUCCEEDED`, `FAILED`, or `TIMED_OUT`.
+- Read execution logs for each run, including `stdout`, `stderr`, and system messages.
+- Persist task definitions, task runs, schedules, and logs.
+- Use Redis for queueing in the runtime path, while keeping in-memory implementations for tests.
+- Maintain scheduling data and process due schedules in a background worker.
 
-- **Spring MVC**: 提供 REST API。
-- **H2 / MyBatis / JDBC**: 持久化任务定义、运行状态和执行日志。
-- **Spring Data Redis**: 提供 Redis list 队列实现，用于运行 ID 入队和 worker 消费。
-- **JUnit 5 / Spring Boot Test / MockMvc**: 覆盖 API、仓储、队列和执行器行为。
-- **Java Process API**: 执行本地 shell 命令。
-- **ConcurrentHashMap / CopyOnWriteArrayList / ConcurrentLinkedQueue**: 保留为内存仓储和内存队列的单元测试对照实现。
+### REST API surface
 
-### 已引入但未作为当前阶段使用的依赖
+TaskRunner currently exposes these endpoints:
 
-`build.gradle` 中仍保留 GraphQL、SOAP 等依赖。这些属于后续阶段可选能力，当前核心任务运行流程不依赖它们。
+- `GET /health`
+- `POST /tasks`
+- `GET /tasks/{taskId}`
+- `POST /tasks/{taskId}/runs`
+- `GET /runs/{runId}`
+- `GET /runs/{runId}/logs`
 
-## 当前项目结构
-
-```text
-src/main/java/com/generate/taskrunner/
-├── TaskRunnerApplication.java
-├── api/
-│   ├── HealthController.java
-│   ├── TaskController.java
-│   └── dto/
-│       ├── CreateTaskRequest.java
-│       ├── TaskLogResponse.java
-│       ├── TaskResponse.java
-│       └── TaskRunResponse.java
-├── domain/
-│   ├── TaskDefinition.java
-│   ├── TaskLogEntry.java
-│   ├── TaskRun.java
-│   └── TaskRunStatus.java
-├── execution/
-│   ├── ProcessTaskExecutorService.java
-│   ├── QueuedTaskWorker.java
-│   ├── TaskExecutionException.java
-│   ├── TaskExecutorService.java
-│   └── TaskProcessRunner.java
-├── queue/
-│   ├── InMemoryTaskRunQueue.java
-│   ├── RedisTaskRunQueue.java
-│   └── TaskRunQueue.java
-├── repository/
-│   ├── InMemoryTaskDefinitionRepository.java
-│   ├── InMemoryTaskRunRepository.java
-│   ├── PersistentTaskDefinitionRepository.java
-│   ├── PersistentTaskRunRepository.java
-│   ├── TaskDefinitionRepository.java
-│   ├── TaskRunRepository.java
-│   └── mybatis/
-│       ├── TaskDefinitionMapper.java
-│       ├── TaskDefinitionRow.java
-│       ├── TaskLogRow.java
-│       ├── TaskRunMapper.java
-│       └── TaskRunRow.java
-```
-
-测试结构：
+### Architecture at a glance
 
 ```text
-src/test/java/com/generate/taskrunner/
-├── TaskRunnerApplicationTests.java
-├── api/
-│   ├── HealthControllerTest.java
-│   └── TaskControllerTest.java
-├── execution/
-│   ├── ProcessTaskExecutorServiceTest.java
-│   ├── QueuedTaskWorkerTest.java
-│   └── TaskProcessRunnerTest.java
-├── queue/
-│   └── InMemoryTaskRunQueueTest.java
-├── repository/
-│   ├── InMemoryTaskRepositoryTest.java
-│   └── PersistentTaskRepositoryTest.java
+api/         HTTP controllers and request/response DTOs
+
+domain/      Task, run, log, and schedule domain models
+
+execution/   Queue consumer and local command runner
+
+queue/       Queue abstraction plus Redis and in-memory implementations
+
+repository/  Persistence abstraction plus H2/MyBatis implementations
+
+schedule/    Schedule model, repository, and worker
 ```
 
-## 已实现功能
+### Runtime flow
 
-### 1. 健康检查
+1. A client creates a task definition through the API.
+2. Starting a run creates a `QUEUED` record and pushes the run ID into the queue.
+3. `QueuedTaskWorker` polls the queue, checks concurrency and retry rules, and reloads the task definition.
+4. `TaskProcessRunner` executes the command through the local shell, captures output, and updates the run record.
+5. Logs are written as the command runs and are later returned by the run-log API.
+6. The schedule worker periodically scans due schedules and triggers the same execution path in the background.
 
-`GET /health`
+### Storage model
 
-响应：
+The database schema is defined in `src/main/resources/schema.sql` and currently includes these tables:
 
-```json
-{
-  "status": "UP"
-}
-```
+- `task_definitions`
+- `task_runs`
+- `task_run_logs`
+- `task_schedules`
 
-### 2. 创建任务定义
-
-`POST /tasks`
-
-请求示例：
-
-```json
-{
-  "name": "Say hello",
-  "command": "printf hello",
-  "workingDirectory": null,
-  "timeoutSeconds": 10
-}
-```
-
-行为：
-
-- `name` 不能为空。
-- `command` 不能为空。
-- `timeoutSeconds` 缺省为 60 秒。
-- `timeoutSeconds` 必须在 1 到 3600 秒之间。
-- 返回 `201 Created` 和任务详情。
-
-### 3. 查询任务定义
-
-`GET /tasks/{taskId}`
-
-行为：
-
-- 存在时返回任务详情。
-- 不存在时返回 `404 Not Found`。
-
-### 4. 启动任务运行
-
-`POST /tasks/{taskId}/runs`
-
-行为：
-
-- 为任务创建一次运行实例。
-- 将运行记录保存为 `QUEUED`，并把运行 ID 放入任务运行队列。
-- worker 从队列消费运行 ID，加载任务定义后异步执行本地 shell 命令。
-- 返回 `202 Accepted` 和运行 ID。
-- 缺失任务返回 `404 Not Found`。
-
-### 5. 查询运行状态
-
-`GET /runs/{runId}`
-
-运行状态包括：
+The persisted run states are:
 
 - `QUEUED`
 - `RUNNING`
@@ -160,139 +77,153 @@ src/test/java/com/generate/taskrunner/
 - `FAILED`
 - `TIMED_OUT`
 
-状态流转：
+### Configuration
+
+Most runtime knobs are supplied through Spring properties with sensible defaults in code. The main ones are:
+
+- `taskrunner.worker.enabled`
+- `taskrunner.worker.poll-delay-ms`
+- `taskrunner.worker.max-concurrent-runs`
+- `taskrunner.worker.max-attempts`
+- `taskrunner.worker.retry-delay-ms`
+- `taskrunner.scheduler.enabled`
+- `taskrunner.scheduler.poll-delay-ms`
+- `taskrunner.queue.redis-key`
+
+`src/main/resources/application.properties` is intentionally minimal; the code provides the default behavior.
+
+### Testing and development
+
+The project uses:
+
+- JUnit 5
+- Spring Boot Test
+- MockMvc for HTTP-layer tests
+- In-memory queue and repository implementations for isolated tests
+
+Test coverage currently focuses on:
+
+- application startup
+- health check behavior
+- task creation and lookup
+- run creation, status lookup, and logs
+- persistence behavior
+- queue FIFO behavior and bounded capacity
+- command execution success, failure, timeout, and retry handling
+
+### Scope notes
+
+- REST and worker-based task execution are the current public-facing features.
+- Scheduling exists as background infrastructure backed by persistence and a worker; public API exposure can evolve later.
+- Additional dependencies in `build.gradle` are kept for future expansion and are not part of the current public feature surface.
+
+## 中文
+
+### 概述
+
+TaskRunner 是一个基于 Spring Boot 3.0.1 和 Java 17 的轻量级任务运行平台。它允许用户定义本地 shell 命令任务、异步排队执行、查看运行状态与日志，并使用一个简单的关系型数据模型保存执行历史。
+
+这个应用当前对外的主要形态是 REST API。运行时由队列 worker 和命令执行器组成，持久化则通过 H2 和 MyBatis 完成。
+
+### 当前能力
+
+- 创建任务定义，包含名称、命令、工作目录和超时时间。
+- 为任务定义启动异步运行。
+- 跟踪运行状态，从 `QUEUED` 到 `RUNNING`，再到 `SUCCEEDED`、`FAILED` 或 `TIMED_OUT`。
+- 读取每次运行的执行日志，包括 `stdout`、`stderr` 和系统消息。
+- 持久化任务定义、运行记录、调度信息和日志。
+- 运行时使用 Redis 做队列分发，同时保留内存实现用于测试。
+- 保存调度数据，并通过后台 worker 处理到期的调度。
+
+### REST API
+
+当前公开的接口包括：
+
+- `GET /health`
+- `POST /tasks`
+- `GET /tasks/{taskId}`
+- `POST /tasks/{taskId}/runs`
+- `GET /runs/{runId}`
+- `GET /runs/{runId}/logs`
+
+### 架构概览
 
 ```text
-QUEUED -> RUNNING -> SUCCEEDED
-QUEUED -> RUNNING -> FAILED
-QUEUED -> RUNNING -> TIMED_OUT
+api/         HTTP 控制器以及请求/响应 DTO
+
+domain/      任务、运行、日志和调度的领域模型
+
+execution/   队列消费者与本地命令执行器
+
+queue/       队列抽象，以及 Redis / 内存实现
+
+repository/  持久化抽象，以及 H2 / MyBatis 实现
+
+schedule/    调度模型、仓储和 worker
 ```
 
-### 6. 查询运行日志
+### 运行流程
 
-`GET /runs/{runId}/logs`
+1. 客户端先通过 API 创建任务定义。
+2. 启动运行时会先创建一条 `QUEUED` 记录，并把运行 ID 放入队列。
+3. `QueuedTaskWorker` 轮询队列，检查并发与重试规则，然后重新加载任务定义。
+4. `TaskProcessRunner` 通过本地 shell 执行命令，采集输出，并更新运行记录。
+5. 日志会在命令执行过程中持续写入，后续可通过运行日志接口读取。
+6. 调度 worker 会定期扫描到期调度，并在后台走同一条执行路径。
 
-日志条目字段：
+### 存储模型
 
-- `timestamp`
-- `stream`: `stdout`、`stderr` 或 `system`
-- `message`
+数据库结构定义在 `src/main/resources/schema.sql`，当前包含这些表：
 
-### 7. H2/MyBatis 持久化
+- `task_definitions`
+- `task_runs`
+- `task_run_logs`
+- `task_schedules`
 
-运行时默认使用 H2/MyBatis 保存：
+持久化的运行状态包括：
 
-- 任务定义：`task_definitions`
-- 运行记录：`task_runs`
-- 运行日志：`task_run_logs`
+- `QUEUED`
+- `RUNNING`
+- `SUCCEEDED`
+- `FAILED`
+- `TIMED_OUT`
 
-REST API 行为保持不变；仓储接口仍是 `TaskDefinitionRepository` 和 `TaskRunRepository`。内存仓储不再作为默认 Spring Bean，只保留给直接实例化的单元测试使用。
+### 配置说明
 
-### 8. 队列化执行
+大部分运行参数都通过 Spring 配置属性提供，并在代码里设置了合理默认值。主要包括：
 
-`TaskExecutorService` 创建运行记录后只负责入队；`QueuedTaskWorker` 从队列取出运行 ID，重新加载 `TaskRun` 和 `TaskDefinition`，再交给 `TaskProcessRunner` 执行本地命令。
+- `taskrunner.worker.enabled`
+- `taskrunner.worker.poll-delay-ms`
+- `taskrunner.worker.max-concurrent-runs`
+- `taskrunner.worker.max-attempts`
+- `taskrunner.worker.retry-delay-ms`
+- `taskrunner.scheduler.enabled`
+- `taskrunner.scheduler.poll-delay-ms`
+- `taskrunner.queue.redis-key`
 
-队列实现：
+`src/main/resources/application.properties` 保持得很轻量，默认行为主要由代码提供。
 
-- 运行时默认使用 `RedisTaskRunQueue`，基于 Redis list 保存待执行运行 ID。
-- 测试和局部单元验证使用 `InMemoryTaskRunQueue`，不要求本机启动 Redis。
-- `InMemoryTaskRunQueue` 支持有界容量，队列已满时抛出 `TaskRunQueueFullException`。
-- worker 通过 `taskrunner.worker.max-concurrent-runs` 限制同时处于 `RUNNING` 的任务数量，达到上限时把运行 ID 放回队列等待后续轮询。
-- worker 通过 `taskrunner.worker.max-attempts` 和 `taskrunner.worker.retry-delay-ms` 控制失败/超时运行的最大尝试次数和重试延迟。
+### 测试与开发
 
-## 运行方式
+项目使用：
 
-### 启动应用
+- JUnit 5
+- Spring Boot Test
+- MockMvc 做 HTTP 层测试
+- 内存队列与内存仓储做隔离测试
 
-```bash
-./gradlew bootRun
-```
+当前测试主要覆盖：
 
-默认服务地址：`http://localhost:8080`
+- 应用启动
+- 健康检查
+- 任务创建与查询
+- 运行创建、状态查询与日志查询
+- 持久化行为
+- 队列 FIFO 行为和有界容量
+- 命令执行成功、失败、超时和重试处理
 
-### 运行测试
+### 范围说明
 
-```bash
-./gradlew test
-```
-
-## API 快速示例
-
-创建任务：
-
-```bash
-curl -s -X POST http://localhost:8080/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Say hello","command":"printf hello","timeoutSeconds":10}'
-```
-
-启动运行：
-
-```bash
-curl -s -X POST http://localhost:8080/tasks/<taskId>/runs
-```
-
-查询运行状态：
-
-```bash
-curl -s http://localhost:8080/runs/<runId>
-```
-
-查询运行日志：
-
-```bash
-curl -s http://localhost:8080/runs/<runId>/logs
-```
-
-## 测试覆盖
-
-当前测试覆盖：
-
-- Spring 应用上下文加载。
-- `/health` 健康检查。
-- 任务创建、参数校验、任务查询。
-- 任务运行启动、状态查询、日志查询。
-- 缺失任务和缺失运行的 `404` 行为。
-- 持久化仓储保存、更新、日志顺序读取。
-- 内存仓储保存、更新、日志顺序读取。
-- 队列抽象、内存队列 FIFO 行为和有界容量行为。
-- 本地命令执行成功、失败退出码、超时处理。
-- 队列 worker 消费运行 ID、缺失任务失败处理、非排队运行跳过、并发上限控制和失败重试。
-
-## Roadmap
-
-### Phase 1: MVP Core Platform（已完成）
-
-- 创建任务定义。
-- 异步启动本地命令任务。
-- 查询任务和运行状态。
-- 捕获 stdout/stderr/system 日志。
-- 使用内存仓储支撑端到端流程。
-
-### Phase 2: Persistence and Operational Safety（部分完成）
-
-- 已完成：使用 H2/MyBatis 持久化任务定义、运行记录和日志。
-- 已完成：运行时仓储切换为持久化实现，REST API 行为保持不变。
-- 待完成：日志保留策略。
-- 待完成：取消运行能力。
-- 待完成：Spring Actuator 或等价监控端点。
-
-### Phase 3: Scheduling and Queueing（部分完成）
-
-- 已完成：运行创建与命令执行解耦，运行 ID 先入队再由 worker 消费执行。
-- 已完成：提供 Redis list 队列实现。
-- 已完成：提供内存队列用于测试，默认测试套件不依赖外部 Redis。
-- 已完成：提供内存队列有界容量和 worker 并发上限控制。
-- 已完成：提供失败/超时重试策略、最大尝试次数和延迟退避配置。
-- 待完成：cron/fixed-delay 调度。
-
-### Phase 4: Product Hardening
-
-- 增加认证授权或 API Key。
-- 增加命令执行沙箱和权限隔离。
-- 增加结构化日志、指标和 API 文档。
-- 在 API 稳定后再考虑 UI。
-
-## 安全说明
-
-当前 MVP 会执行调用方提交的本地 shell 命令，只适合本地可信环境。不要在公网或不可信网络中暴露该服务；如果需要部署到共享环境，必须先增加认证、授权、命令白名单或沙箱隔离。
+- 目前对外可见的核心能力是 REST 接口和 worker 驱动的任务执行。
+- 调度能力已作为后台基础设施存在，依赖持久化和 worker；后续可以再决定是否公开为 API。
+- `build.gradle` 里保留了一些未来扩展依赖，但它们不属于当前公开的功能面。
